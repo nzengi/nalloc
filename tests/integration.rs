@@ -1,4 +1,4 @@
-use nalloc::NAlloc;
+use zk_nalloc::NAlloc;
 use std::alloc::{GlobalAlloc, Layout};
 
 #[test]

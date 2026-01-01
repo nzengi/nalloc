@@ -1,13 +1,25 @@
 [package]
-name = "nalloc"
+name = "zk-nalloc"
 version = "0.1.0"
 edition = "2021"
-authors = ["Antigravity <antigravity@google.com>"]
-description = "High-performance, deterministic memory allocator for ZK-Proof systems."
+authors = ["nzengi <howyaniii@gmail.com>"]
+description = "High-performance, deterministic memory allocator optimized for Zero-Knowledge Proof (ZKP) systems and cryptographic provers."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/nzengi/nalloc"
+keywords = ["cryptography", "zkp", "allocator", "performance", "memory"]
+categories = ["memory-management", "cryptography"]
 
 [dependencies]
 rustix = { version = "0.38", features = ["mm"] }
 libc = "0.2"
 
+[dev-dependencies]
+criterion = "0.5"
+
 [target.'cfg(target_vendor = "apple")'.dependencies]
 mach2 = "0.4"
+
+[[bench]]
+name = "alloc_benchmark"
+harness = false
