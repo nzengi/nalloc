@@ -1,0 +1,13 @@
+[package]
+name = "nalloc"
+version = "0.1.0"
+edition = "2021"
+authors = ["Antigravity <antigravity@google.com>"]
+description = "High-performance, deterministic memory allocator for ZK-Proof systems."
+
+[dependencies]
+rustix = { version = "0.38", features = ["mm"] }
+libc = "0.2"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+mach2 = "0.4"
