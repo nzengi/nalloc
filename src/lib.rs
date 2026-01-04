@@ -4,47 +4,80 @@
 //! specifically designed for Zero-Knowledge proof systems like zkSNARKs,
 //! zkSTARKs, Plonk, and Groth16.
 //!
+//! # Features
+//!
+//! - **Arena-based allocation**: Pre-reserved memory pools for different workload types
+//! - **Bump allocation**: O(1) allocation via atomic pointer increment
+//! - **Security-first**: Volatile secure wiping for witness data
+//! - **Cache-optimized**: 64-byte alignment for FFT/NTT SIMD operations
+//! - **Cross-platform**: Linux, macOS, Windows, and Unix support
+//!
 //! # Usage
 //!
 //! As a global allocator:
-//! ```rust,ignore
-//! use nalloc::NAlloc;
+//! ```rust,no_run
+//! use zk_nalloc::NAlloc;
 //!
 //! #[global_allocator]
 //! static ALLOC: NAlloc = NAlloc::new();
+//!
+//! fn main() {
+//!     let data = vec![0u64; 1000];
+//!     println!("Allocated {} elements", data.len());
+//! }
 //! ```
 //!
 //! Using specialized arenas directly:
-//! ```rust,ignore
+//! ```rust
+//! use zk_nalloc::NAlloc;
+//!
 //! let alloc = NAlloc::new();
 //! let witness = alloc.witness();
 //! let ptr = witness.alloc(1024, 8);
-//! // ... compute ...
-//! witness.secure_wipe();
+//! assert!(!ptr.is_null());
+//!
+//! // Securely wipe when done
+//! unsafe { witness.secure_wipe(); }
 //! ```
 
 pub mod arena;
 pub mod bump;
+pub mod config;
 pub mod platform;
 pub mod polynomial;
 pub mod witness;
 
-pub use arena::ArenaManager;
+pub use arena::{ArenaManager, ArenaStats};
 pub use bump::BumpAlloc;
+pub use config::*;
 pub use platform::sys;
 pub use polynomial::PolynomialArena;
 pub use witness::WitnessArena;
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::ptr::{copy_nonoverlapping, null_mut};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// The global ZK-optimized allocator.
 ///
 /// `NAlloc` provides a drop-in replacement for the standard Rust global allocator,
 /// with special optimizations for ZK-Proof workloads.
+///
+/// # Memory Strategy
+///
+/// - **Large allocations (>1MB)**: Routed to Polynomial Arena (FFT vectors)
+/// - **Small allocations**: Routed to Scratch Arena (temporary buffers)
+/// - **Witness data**: Use `NAlloc::witness()` for security-critical allocations
+///
+/// # Thread Safety
+///
+/// This allocator uses lock-free atomic operations for initialization and
+/// allocation. It's safe to use from multiple threads concurrently.
 pub struct NAlloc {
-    arenas: OnceLock<ArenaManager>,
+    /// Pointer to the ArenaManager (null until initialized)
+    arenas: AtomicPtr<ArenaManager>,
+    /// Flag to prevent re-initialization
+    initializing: AtomicBool,
 }
 
 impl NAlloc {
@@ -53,20 +86,94 @@ impl NAlloc {
     /// The arenas are lazily initialized on the first allocation.
     pub const fn new() -> Self {
         Self {
-            arenas: OnceLock::new(),
+            arenas: AtomicPtr::new(null_mut()),
+            initializing: AtomicBool::new(false),
+        }
+    }
+
+    /// Initialize the arenas if not already done.
+    ///
+    /// This uses a spin-lock pattern with atomic bool to avoid
+    /// the thread-local storage issues that OnceLock has.
+    #[cold]
+    #[inline(never)]
+    fn init_arenas(&self) -> *mut ArenaManager {
+        // Fast path: already initialized
+        let ptr = self.arenas.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            return ptr;
+        }
+
+        // Try to acquire initialization lock
+        if self
+            .initializing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            // We won the race - initialize
+            match ArenaManager::new() {
+                Ok(manager) => {
+                    // Use system allocator to avoid recursive allocation
+                    use std::alloc::{GlobalAlloc, Layout, System};
+                    let layout = Layout::new::<ArenaManager>();
+                    let raw = unsafe { System.alloc(layout) as *mut ArenaManager };
+                    if raw.is_null() {
+                        self.initializing.store(false, Ordering::Release);
+                        panic!("Failed to allocate ArenaManager");
+                    }
+                    unsafe {
+                        std::ptr::write(raw, manager);
+                    }
+                    self.arenas.store(raw, Ordering::Release);
+                    return raw;
+                }
+                Err(_) => {
+                    // Initialization failed - allow retry
+                    self.initializing.store(false, Ordering::Release);
+                    panic!("Failed to initialize nalloc arenas");
+                }
+            }
+        }
+
+        // Another thread is initializing - spin wait
+        loop {
+            std::hint::spin_loop();
+            let ptr = self.arenas.load(Ordering::Acquire);
+            if !ptr.is_null() {
+                return ptr;
+            }
         }
     }
 
     #[inline(always)]
     fn get_arenas(&self) -> &ArenaManager {
-        self.arenas
-            .get_or_init(|| ArenaManager::new().expect("Failed to initialize nalloc arenas"))
+        let ptr = self.arenas.load(Ordering::Acquire);
+        if ptr.is_null() {
+            let ptr = self.init_arenas();
+            unsafe { &*ptr }
+        } else {
+            unsafe { &*ptr }
+        }
     }
 
     /// Access the witness arena directly.
     ///
     /// Use this for allocating sensitive private inputs that need
     /// zero-initialization and secure wiping.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use zk_nalloc::NAlloc;
+    ///
+    /// let alloc = NAlloc::new();
+    /// let witness = alloc.witness();
+    /// let secret_ptr = witness.alloc(256, 8);
+    /// assert!(!secret_ptr.is_null());
+    ///
+    /// // Securely wipe when done
+    /// unsafe { witness.secure_wipe(); }
+    /// ```
     #[inline]
     pub fn witness(&self) -> WitnessArena {
         WitnessArena::new(self.get_arenas().witness())
@@ -75,6 +182,19 @@ impl NAlloc {
     /// Access the polynomial arena directly.
     ///
     /// Use this for FFT/NTT-friendly polynomial coefficient vectors.
+    /// Provides 64-byte alignment by default for SIMD operations.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use zk_nalloc::NAlloc;
+    ///
+    /// let alloc = NAlloc::new();
+    /// let poly = alloc.polynomial();
+    /// let coeffs = poly.alloc_fft_friendly(1024); // 1K coefficients
+    /// assert!(!coeffs.is_null());
+    /// assert_eq!((coeffs as usize) % 64, 0); // 64-byte aligned
+    /// ```
     #[inline]
     pub fn polynomial(&self) -> PolynomialArena {
         PolynomialArena::new(self.get_arenas().polynomial())
@@ -90,10 +210,19 @@ impl NAlloc {
 
     /// Reset all arenas, freeing all allocated memory.
     ///
+    /// The witness arena is securely wiped before reset.
+    ///
     /// # Safety
     /// This will invalidate all previously allocated memory.
     pub unsafe fn reset_all(&self) {
         self.get_arenas().reset_all();
+    }
+
+    /// Get statistics about arena usage.
+    ///
+    /// Useful for monitoring memory consumption and tuning arena sizes.
+    pub fn stats(&self) -> ArenaStats {
+        self.get_arenas().stats()
     }
 }
 
@@ -102,6 +231,10 @@ impl Default for NAlloc {
         Self::new()
     }
 }
+
+// Safety: NAlloc uses atomic operations for all shared state
+unsafe impl Send for NAlloc {}
+unsafe impl Sync for NAlloc {}
 
 unsafe impl GlobalAlloc for NAlloc {
     #[inline(always)]
@@ -113,11 +246,11 @@ unsafe impl GlobalAlloc for NAlloc {
         let arenas = self.get_arenas();
 
         // Strategy:
-        // 1. Large allocations (> 1MB) go to Polynomial Arena (likely vectors)
+        // 1. Large allocations (> threshold) go to Polynomial Arena (likely vectors)
         // 2. Smaller allocations go to Scratch Arena
         // 3. User can explicitly use Witness Arena via NAlloc::witness()
 
-        if layout.size() > 1024 * 1024 {
+        if layout.size() > LARGE_ALLOC_THRESHOLD {
             arenas.polynomial().alloc(layout.size(), layout.align())
         } else {
             arenas.scratch().alloc(layout.size(), layout.align())
@@ -160,6 +293,17 @@ unsafe impl GlobalAlloc for NAlloc {
 
         new_ptr
     }
+
+    #[inline(always)]
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = self.alloc(layout);
+        if !ptr.is_null() {
+            // Note: mmap'd memory is already zeroed, but we zero anyway for
+            // recycled memory or if user specifically requested zeroed allocation.
+            std::ptr::write_bytes(ptr, 0, layout.size());
+        }
+        ptr
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +345,84 @@ mod tests {
             for i in 0..64 {
                 assert_eq!(new_ptr.add(i).read(), i as u8);
             }
+        }
+    }
+
+    #[test]
+    fn test_alloc_zeroed() {
+        let alloc = NAlloc::new();
+        let layout = Layout::from_size_align(1024, 8).unwrap();
+        unsafe {
+            let ptr = alloc.alloc_zeroed(layout);
+            assert!(!ptr.is_null());
+
+            // Verify memory is zeroed
+            for i in 0..1024 {
+                assert_eq!(*ptr.add(i), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_stats() {
+        let alloc = NAlloc::new();
+
+        // Trigger arena initialization with an allocation
+        let layout = Layout::from_size_align(1024, 8).unwrap();
+        unsafe {
+            let _ = alloc.alloc(layout);
+        }
+
+        let stats = alloc.stats();
+        assert!(stats.scratch_used >= 1024);
+        assert!(stats.total_capacity() > 0);
+    }
+
+    #[test]
+    fn test_large_allocation_routing() {
+        let alloc = NAlloc::new();
+
+        // Small allocation (< 1MB) should go to scratch
+        let small_layout = Layout::from_size_align(1024, 8).unwrap();
+        unsafe {
+            let _ = alloc.alloc(small_layout);
+        }
+
+        let stats_after_small = alloc.stats();
+        assert!(stats_after_small.scratch_used >= 1024);
+
+        // Large allocation (> 1MB) should go to polynomial
+        let large_layout = Layout::from_size_align(2 * 1024 * 1024, 64).unwrap();
+        unsafe {
+            let _ = alloc.alloc(large_layout);
+        }
+
+        let stats_after_large = alloc.stats();
+        assert!(stats_after_large.polynomial_used >= 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_concurrent_init() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let alloc = Arc::new(NAlloc::new());
+        let mut handles = vec![];
+
+        // Spawn multiple threads that try to initialize simultaneously
+        for _ in 0..8 {
+            let alloc = Arc::clone(&alloc);
+            handles.push(thread::spawn(move || {
+                let layout = Layout::from_size_align(64, 8).unwrap();
+                unsafe {
+                    let ptr = alloc.alloc(layout);
+                    assert!(!ptr.is_null());
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
         }
     }
 }
